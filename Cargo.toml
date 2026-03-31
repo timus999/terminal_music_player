@@ -1,0 +1,10 @@
+[package]
+name = "music_player"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "1.49" , features = ["rt-multi-thread", "macros", "sync", "time"]}
+ratatui = "0.30"
+crossterm = "0.29.0"
+
