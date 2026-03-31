@@ -1,18 +1,14 @@
 
+mod music;
 mod app;
 mod ui;
-mod input;
-mod event;
 
-use std::io;
+use std::{fs, io, process::Command};
 use crossterm::{
-    execute,
-    terminal::{enable_raw_mode, disable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    event::{self, Event, KeyCode, KeyModifiers}, execute, terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode}
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 
-use app::App;
-use event::{event_channel, Event};
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
@@ -22,20 +18,56 @@ async fn main() -> io::Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::new();
-    let (tx, mut rx) = event_channel();
+    let mut app = app::App::new();
 
-    tokio::spawn(event::tick_task(tx.clone()));
-    tokio::spawn(input::input_task(tx));
+
+
 
     while app.running {
-        terminal.draw(|f| ui::draw(f, &app))?;
+        terminal.draw(|f| ui::draw(f, &mut app))?;
 
-        if let Some(event) = rx.recv().await {
-            match event {
-                Event::Key('q') => app.quit(),
-                _ => {}
+
+        // block until an event arrives - no busy-wait, no wasted CPU
+        // 
+
+        if let Event::Key(key)  = event::read()? {
+            match(key.code, key.modifiers) {
+                // Quit
+                (KeyCode::Char('c'), KeyModifiers::CONTROL) | (KeyCode::Esc, _) => {
+                    app.running = false;
+                }
+            
+
+            // Enter - play selected file(hook in audio backend here)
+            (KeyCode::Enter, _) => {
+                if let Some(file) = app.selected_file() {
+                    let _ = file.path.to_string_lossy().to_string();
+                    // TODO: send file.path to audio engine
+                    
+                }
             }
+
+            // Navigation
+            (KeyCode::Down, _) => app.scroll_down(),
+            (KeyCode::Up, _) => app.scroll_up(),
+
+            // Typing - update query and refilter
+            (KeyCode::Char(c), _) => {
+                let mut q = app.search_query.clone();
+                q.push(c);
+                app.update_search(&q);
+            }
+
+
+            // Backspace
+            (KeyCode::Backspace, _) => {
+                let mut q = app.search_query.clone();
+                q.pop();
+                app.update_search(&q);
+            }
+
+            _ => {}
+        }
         }
     }
 
