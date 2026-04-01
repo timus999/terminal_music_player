@@ -84,11 +84,15 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             .collect()
     };
 
-    let results_title = format!(
-        " Results ({} / {}) ",
-        app.filtered_indices.len(),
-        app.music_files.len()
-    );
+    let results_title = if app.is_scanning {
+        format!("Results ({} / scanning...) ", app.filtered_indices.len())
+    } else {
+        format!(
+            " Results ({} / {}) ",
+            app.filtered_indices.len(),
+            app.music_files.len()
+        )
+    };
 
     let lists = List::new(items)
         .block(Block::default().borders(Borders::ALL).title(results_title))

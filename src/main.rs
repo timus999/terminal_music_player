@@ -3,7 +3,7 @@ mod music;
 mod app;
 mod ui;
 
-use std::{fs, io, process::Command};
+use std::{fs, io, path::PathBuf, process::Command};
 use crossterm::{
     event::{self, Event, KeyCode, KeyModifiers}, execute, terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode}
 };
@@ -18,18 +18,22 @@ async fn main() -> io::Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = app::App::new();
+    let mut app = app::App::new(PathBuf::from("/home/timus/Music"));
 
 
 
 
     while app.running {
+        app.poll_scan_results();
         terminal.draw(|f| ui::draw(f, &mut app))?;
 
 
         // block until an event arrives - no busy-wait, no wasted CPU
         // 
 
+        if event::poll(std::time::Duration::from_millis(50))? {
+            
+        
         if let Event::Key(key)  = event::read()? {
             match(key.code, key.modifiers) {
                 // Quit
@@ -67,6 +71,7 @@ async fn main() -> io::Result<()> {
             }
 
             _ => {}
+        }
         }
         }
     }
