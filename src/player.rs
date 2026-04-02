@@ -16,7 +16,7 @@ pub enum PlayerCommand {
 /// Status the Player thread sends back to App
 #[derive(Clone)]
 pub enum PlayerStatus {
-    NowPlaying(String), // Display name of the file
+    NowPlaying(Option<String>), // Display name of the file
     Paused,
     Stopped,
     FinishedNaturally,
@@ -87,7 +87,7 @@ pub fn spawn_player(cmd_rx: Receiver<PlayerCommand>, status_tx: Sender<PlayerSta
                         player.append(source);
                         player.play();
                         is_playing = true;
-                        let _ = status_tx.send(PlayerStatus::NowPlaying(name));
+                        let _ = status_tx.send(PlayerStatus::NowPlaying(Some(name)));
                     }
 
                     PlayerCommand::Pause => {
@@ -98,12 +98,15 @@ pub fn spawn_player(cmd_rx: Receiver<PlayerCommand>, status_tx: Sender<PlayerSta
                     PlayerCommand::Resume => {
                         player.play();
 
+                        let _ = status_tx.send(PlayerStatus::NowPlaying(None));
+
                         // Re-send NowPlaying so the UI status bar stays correct
                         // (App caches the current name for this)
                     }
 
                     PlayerCommand::Stop => {
                         player.stop();
+                        is_playing = false;
                         let _ = status_tx.send(PlayerStatus::Stopped);
                     }
                 },

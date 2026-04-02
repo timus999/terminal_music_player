@@ -164,7 +164,7 @@ impl App {
             let _ = self.player_cmd_tx.send(PlayerCommand::Resume);
 
             // Re-emit NowPlaying so UI shows the track name again
-            self.player_status = PlayerStatus::NowPlaying(self.current_track_name.clone());
+            self.player_status = PlayerStatus::NowPlaying(Some(self.current_track_name.clone()));
             self.is_paused = false;
         } else {
             let _ = self.player_cmd_tx.send(PlayerCommand::Pause);
@@ -182,17 +182,31 @@ impl App {
     pub fn poll_player_status(&mut self) {
         while let Ok(status) = self.player_status_rx.try_recv() {
             // Cache track name so toggle_pause can re-display it after resume
-            if let PlayerStatus::NowPlaying(ref name) = status {
-                self.current_track_name = name.clone();
+            match status {
+                PlayerStatus::NowPlaying(Some(ref name)) => {
+                    self.current_track_name = name.clone();
+                    self.is_paused = false;
+                }
+                PlayerStatus::NowPlaying(None) => {
+                    // Restore cached name and skip the standard status update
+                    self.player_status =
+                        PlayerStatus::NowPlaying(Some(self.current_track_name.clone()));
+                    self.is_paused = false;
+                    continue;
+                }
+
+                PlayerStatus::FinishedNaturally => {
+                    self.scroll_down();
+                    self.play_selected();
+                    self.is_paused = false;
+                }
+                PlayerStatus::Error(_) => {
+                    self.is_paused = false;
+                }
+                _ => {}
             }
 
-            if let PlayerStatus::FinishedNaturally = status {
-                // Hook for auto-advance: uncomment when ready
-                // self.scroll_down();
-                // self.play_selected();
-            }
             self.player_status = status;
-            // self.is_paused = false;
         }
     }
 }

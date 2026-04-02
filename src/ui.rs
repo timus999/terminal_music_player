@@ -117,13 +117,14 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     // -- Now Playing ---------------------
 
     let (now_playing_text, bar_color) = match &app.player_status {
-        PlayerStatus::NowPlaying(name) => (format!("  Now playing: {name}"), Color::Green),
+        PlayerStatus::NowPlaying(Some(name)) => (format!("  Now playing: {name}"), Color::Green),
+        PlayerStatus::NowPlaying(None) => ("   Enter to play".into(), Color::DarkGray),
         PlayerStatus::Paused => (
             format!("  Paused: {}", app.current_track_name),
             Color::Yellow,
         ),
         PlayerStatus::Stopped => (
-            "  Stopped  -  press Enter to play, Space to pause, s to stop".to_string(),
+            "  Stopped  -  press Enter to play, Space to pause, s to stop".into(),
             Color::DarkGray,
         ),
         PlayerStatus::FinishedNaturally => (
