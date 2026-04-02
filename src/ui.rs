@@ -6,7 +6,7 @@ use ratatui::{
     Frame,
 };
 
-use crate::app::App;
+use crate::{app::App, player::PlayerStatus};
 
 pub fn draw(f: &mut Frame, app: &mut App) {
     // -- Layout -----------------------------
@@ -14,6 +14,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     // [0] Title bar         -- fixed height, branding only
     // [1] Search input      -- fixed height, one line of text
     // [2] Results list      -- fills remaining space
+    // [3] Now Playing       -- now playing bar
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .margin(1)
@@ -21,6 +22,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             Constraint::Length(3), // title: exactly 3 rows (border + 1 line + border)
             Constraint::Length(3), // search input : same
             Constraint::Min(0),    // results : everything else - scales with terminal size
+            Constraint::Length(3), // now playing bar
         ])
         .split(f.area());
 
@@ -33,12 +35,14 @@ pub fn draw(f: &mut Frame, app: &mut App) {
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         )
-        .block(Block::default().borders(Borders::ALL));
+        .block(Block::default());
 
     f.render_widget(title, chunks[0]);
+
+    // ---- Search ------
     // Show a blinking cursor effect by appending "" to the query.
     // the yellow border signals "this is the active input field".
-    let search_text = format!("{}_", app.search_query); // underscore = simple cursor
+    let search_text = format!(" {}_", app.search_query); // underscore = simple cursor
 
     let search = Paragraph::new(search_text)
         .style(Style::default().fg(Color::White))
@@ -51,6 +55,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     f.render_widget(search, chunks[1]);
 
     // -- Result Lists --
+    //
+    //
     let is_empty = app.filtered_indices.is_empty();
     let items: Vec<ListItem> = if is_empty {
         // Render a single greyed-out hint row instead of nothing
@@ -85,7 +91,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     };
 
     let results_title = if app.is_scanning {
-        format!("Results ({} / scanning...) ", app.filtered_indices.len())
+        format!(" Results ({} / scanning...) ", app.filtered_indices.len())
     } else {
         format!(
             " Results ({} / {}) ",
@@ -103,10 +109,42 @@ pub fn draw(f: &mut Frame, app: &mut App) {
                 .fg(Color::Black)
                 .add_modifier(Modifier::BOLD),
         )
-        .highlight_symbol("▶ "); // clear visual indicator of selected row
+        .highlight_symbol(" ▶ "); // clear visual indicator of selected row
 
     // render_stateful_widget mutates list_state (scroll offset), so it needs &mut
     f.render_stateful_widget(lists, chunks[2], &mut app.list_state);
+
+    // -- Now Playing ---------------------
+
+    let (now_playing_text, bar_color) = match &app.player_status {
+        PlayerStatus::NowPlaying(name) => (format!("  Now playing: {name}"), Color::Green),
+        PlayerStatus::Paused => (
+            format!("  Paused: {}", app.current_track_name),
+            Color::Yellow,
+        ),
+        PlayerStatus::Stopped => (
+            "  Stopped  -  press Enter to play, Space to pause, s to stop".to_string(),
+            Color::DarkGray,
+        ),
+        PlayerStatus::FinishedNaturally => (
+            format!(
+                "  Finished: {} - press Enter to play again",
+                app.current_track_name
+            ),
+            Color::DarkGray,
+        ),
+        PlayerStatus::Error(msg) => (format!("  Error: {msg}"), Color::Red),
+    };
+
+    let now_playing = Paragraph::new(now_playing_text)
+        .style(Style::default().fg(bar_color))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Player ")
+                .border_style(Style::default().fg(bar_color)),
+        );
+    f.render_widget(now_playing, chunks[3]);
 }
 
 fn split_extension(name: &str) -> (&str, &str) {

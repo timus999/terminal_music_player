@@ -1,11 +1,14 @@
 use crate::music::scan_music_dir_async;
 use crate::music::MusicFile;
+use crate::player::spawn_player;
+use crate::player::PlayerCommand;
+use crate::player::PlayerStatus;
 use ratatui::widgets::ListState;
-use std::fs;
-use std::io;
 use std::path::PathBuf;
+
 use std::sync::mpsc;
 use std::sync::mpsc::Receiver;
+use std::sync::mpsc::Sender;
 
 pub struct App {
     pub running: bool,
@@ -24,16 +27,27 @@ pub struct App {
 
     // Channel receiver - None once scanning is complete
     scan_rx: Option<Receiver<MusicFile>>,
+
+    // -- Player ------
+    pub player_status: PlayerStatus, // last known status - drives the UI bar
+    pub current_track_name: String,  // cached so Resume can re-display it
+    pub is_paused: bool,
+    player_cmd_tx: Sender<PlayerCommand>, // sends commands to audio thread
+    player_status_rx: Receiver<PlayerStatus>, // receive status back
 }
 
 impl App {
     pub fn new(music_dir: PathBuf) -> Self {
-        let (tx, rx) = mpsc::channel();
+        // --- Scan channel ---
+        let (scan_tx, scan_rx) = mpsc::channel();
 
         // kick off background scan immediately - does NOT block
-        scan_music_dir_async(music_dir, tx);
+        scan_music_dir_async(music_dir, scan_tx);
 
-        // initially show all
+        // --- Player channel ---
+        let (cmd_tx, cmd_rx) = mpsc::channel::<PlayerCommand>();
+        let (status_tx, status_rx) = mpsc::channel::<PlayerStatus>();
+        spawn_player(cmd_rx, status_tx);
 
         Self {
             running: true,
@@ -42,7 +56,13 @@ impl App {
             filtered_indices: Vec::new(),
             list_state: ListState::default(),
             is_scanning: true,
-            scan_rx: Some(rx),
+            scan_rx: Some(scan_rx),
+
+            player_status: PlayerStatus::Stopped,
+            current_track_name: String::new(),
+            is_paused: false,
+            player_cmd_tx: cmd_tx,
+            player_status_rx: status_rx,
         }
     }
 
@@ -127,14 +147,52 @@ impl App {
         };
         self.list_state.select(Some(prev));
     }
-    pub fn search_local_dir() -> io::Result<Vec<PathBuf>> {
-        let music_files: Vec<_> = fs::read_dir(".")?
-            .filter_map(|res| res.ok())
-            .map(|entry| entry.path())
-            .filter(|path| path.is_file())
-            .filter(|path| path.extension() == Some("mp3".as_ref()))
-            .collect();
 
-        Ok(music_files)
+    /// Play the currently highlighted file. Called on Enter.
+    pub fn play_selected(&mut self) {
+        if let Some(file) = self.selected_file() {
+            let path = file.path.clone();
+            self.is_paused = false;
+            // Silently ignore send errors - player thread may have exited
+            let _ = self.player_cmd_tx.send(PlayerCommand::Play(path));
+        }
+    }
+
+    // Toggle pause/resume. Called on Space.
+    pub fn toggle_pause(&mut self) {
+        if self.is_paused {
+            let _ = self.player_cmd_tx.send(PlayerCommand::Resume);
+
+            // Re-emit NowPlaying so UI shows the track name again
+            self.player_status = PlayerStatus::NowPlaying(self.current_track_name.clone());
+            self.is_paused = false;
+        } else {
+            let _ = self.player_cmd_tx.send(PlayerCommand::Pause);
+            self.is_paused = true;
+        }
+    }
+
+    /// Stop playback. Called on 's'.
+    pub fn stop(&mut self) {
+        let _ = self.player_cmd_tx.send(PlayerCommand::Stop);
+        self.is_paused = false;
+    }
+
+    /// Drain all pending player status update. Call once per frame.
+    pub fn poll_player_status(&mut self) {
+        while let Ok(status) = self.player_status_rx.try_recv() {
+            // Cache track name so toggle_pause can re-display it after resume
+            if let PlayerStatus::NowPlaying(ref name) = status {
+                self.current_track_name = name.clone();
+            }
+
+            if let PlayerStatus::FinishedNaturally = status {
+                // Hook for auto-advance: uncomment when ready
+                // self.scroll_down();
+                // self.play_selected();
+            }
+            self.player_status = status;
+            // self.is_paused = false;
+        }
     }
 }
