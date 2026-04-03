@@ -1,0 +1,63 @@
+warning: unused import: `VideoId`
+ --> src/youtube.rs:2:24
+  |
+2 | use rustypipe::model::{VideoId, VideoItem};
+  |                        ^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused imports: `ItemType` and `SearchFilter`
+ --> src/youtube.rs:3:39
+  |
+3 | use rustypipe::param::search_filter::{ItemType, SearchFilter};
+  |                                       ^^^^^^^^  ^^^^^^^^^^^^
+
+warning: unused variable: `browser`
+   --> src/player.rs:269:29
+    |
+269 | fn launch_mpv(target: &str, browser: &str) -> Result<Child, String> {
+    |                             ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_browser`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `browser` is never read
+  --> src/app.rs:22:5
+   |
+18 | pub struct App {
+   |            --- field in this struct
+...
+22 |     browser: String,
+   |     ^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: variant `FetchingStream` is never constructed
+  --> src/player.rs:22:5
+   |
+20 | pub enum PlayerStatus {
+   |          ------------ variant in this enum
+21 |     NowPlaying(Option<String>),
+22 |     FetchingStream,
+   |     ^^^^^^^^^^^^^^
+   |
+   = note: `PlayerStatus` has a derived impl for the trait `Clone`, but this is intentionally ignored during dead code analysis
+
+warning: function `kill_mpv_backend` is never used
+   --> src/player.rs:311:4
+    |
+311 | fn kill_mpv_backend(backend: &mut PlaybackBackend) {
+    |    ^^^^^^^^^^^^^^^^
+
+warning: variant `StreamUrl` is never constructed
+  --> src/youtube.rs:31:5
+   |
+29 | pub enum YoutubeResult {
+   |          ------------- variant in this enum
+30 |     SearchResults(Vec<YoutubeVideo>),
+31 |     StreamUrl(String), // ready-to-play URL -sent directly to player
+   |     ^^^^^^^^^
+
+warning: `music_player` (bin "music_player") generated 7 warnings (run `cargo fix --bin "music_player" -p music_player` to apply 3 suggestions)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.36s
+     Running `target/debug/music_player firefox`
+[mpv] stderr: 

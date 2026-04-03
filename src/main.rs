@@ -4,14 +4,14 @@ mod player;
 mod ui;
 mod youtube;
 
-use std::{io, path::PathBuf};
-
 use crossterm::{
     event::{self, Event, KeyCode, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
+use dirs;
 use ratatui::{backend::CrosstermBackend, Terminal};
+use std::{io, path::PathBuf};
 
 fn main() -> io::Result<()> {
     enable_raw_mode()?;
@@ -20,8 +20,12 @@ fn main() -> io::Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let api_key = std::env::var("YT_API_KEY").unwrap_or_else(|_| "".into());
-    let mut app = app::App::new(PathBuf::from("/home/timus/Music"), api_key);
+    let cookies_path = std::env::var("YT_COOKIES").unwrap_or_else(|_| {
+        dirs::home_dir()
+            .map(|h| h.join("cookies.txt").to_string_lossy().to_string())
+            .unwrap_or_else(|| "cookies.txt".to_string())
+    });
+    let mut app = app::App::new(PathBuf::from("/home/timus/Music"), cookies_path);
 
     while app.running {
         app.poll_scan_results();
@@ -42,12 +46,10 @@ fn main() -> io::Result<()> {
 
                     // Tab always switches mode regardless of what's focused
                     (KeyCode::Tab, _) => app.toggle_search_mode(),
+                    (KeyCode::Char('s'), KeyModifiers::CONTROL) => app.submit_youtube_search(),
 
                     // Enter - play selected file(hook in audio backend here)
-                    (KeyCode::Enter, _) => match app.search_mode {
-                        app::SearchMode::Local => app.play_selected(),
-                        app::SearchMode::Youtube => app.submit_youtube_search(),
-                    },
+                    (KeyCode::Enter, _) => app.handle_enter(),
 
                     // Pause / resume
                     (KeyCode::Char(' '), _) => app.toggle_pause(),
