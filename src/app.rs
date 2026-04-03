@@ -3,6 +3,9 @@ use crate::music::MusicFile;
 use crate::player::spawn_player;
 use crate::player::PlayerCommand;
 use crate::player::PlayerStatus;
+use crate::youtube::spawn_youtube_search;
+use crate::youtube::YoutubeSearchResult;
+use crate::youtube::YoutubeVideo;
 use ratatui::widgets::ListState;
 use std::path::PathBuf;
 
@@ -34,10 +37,33 @@ pub struct App {
     pub is_paused: bool,
     player_cmd_tx: Sender<PlayerCommand>, // sends commands to audio thread
     player_status_rx: Receiver<PlayerStatus>, // receive status back
+
+    // --- YouTube search -----------
+    pub search_mode: SearchMode,
+    pub youtube_query: String,
+    pub youtube_results: Vec<YoutubeVideo>,
+    pub youtube_list_state: ListState,
+    pub youtube_status: YoutubeStatus,
+    youtube_query_tx: Sender<String>,
+    youtube_result_rx: Receiver<YoutubeSearchResult>,
+}
+
+// Tab key toggles between these two modes
+pub enum SearchMode {
+    Local,
+    Youtube,
+}
+
+// What the Youtube panel is currently showing
+pub enum YoutubeStatus {
+    Idle,
+    Searching,
+    Done,
+    Error(String),
 }
 
 impl App {
-    pub fn new(music_dir: PathBuf) -> Self {
+    pub fn new(music_dir: PathBuf, yt_api_key: String) -> Self {
         // --- Scan channel ---
         let (scan_tx, scan_rx) = mpsc::channel();
 
@@ -48,6 +74,10 @@ impl App {
         let (cmd_tx, cmd_rx) = mpsc::channel::<PlayerCommand>();
         let (status_tx, status_rx) = mpsc::channel::<PlayerStatus>();
         spawn_player(cmd_rx, status_tx);
+
+        let (yt_query_tx, yt_query_rx) = mpsc::channel::<String>();
+        let (yt_result_tx, yt_result_rx) = mpsc::channel::<YoutubeSearchResult>();
+        spawn_youtube_search(yt_query_rx, yt_result_tx, yt_api_key);
 
         Self {
             running: true,
@@ -63,9 +93,79 @@ impl App {
             is_paused: false,
             player_cmd_tx: cmd_tx,
             player_status_rx: status_rx,
+
+            search_mode: SearchMode::Local,
+            youtube_query: String::new(),
+            youtube_results: Vec::new(),
+            youtube_list_state: ListState::default(),
+            youtube_status: YoutubeStatus::Idle,
+            youtube_query_tx: yt_query_tx,
+            youtube_result_rx: yt_result_rx,
         }
     }
 
+    /// Switch between Local and Youtube mode with Tab
+    pub fn toggle_search_mode(&mut self) {
+        self.search_mode = match self.search_mode {
+            SearchMode::Local => SearchMode::Youtube,
+            SearchMode::Youtube => SearchMode::Local,
+        };
+    }
+
+    /// Fire a Youtube search - called on Enter in Youtube mode.
+    /// Typing does NOT auto-search to avoid hammering the API.
+    pub fn submit_youtube_search(&mut self) {
+        if self.youtube_query.is_empty() {
+            return;
+        }
+        self.youtube_status = YoutubeStatus::Searching;
+        self.youtube_results.clear();
+        self.youtube_list_state = ListState::default();
+        let _ = self.youtube_query_tx.send(self.youtube_query.clone());
+    }
+
+    /// Drain pending Youtube results - call once per frame
+    pub fn poll_youtube_results(&mut self) {
+        while let Ok(result) = self.youtube_result_rx.try_recv() {
+            match result {
+                YoutubeSearchResult::Results(videos) => {
+                    self.youtube_results = videos;
+                    self.youtube_status = YoutubeStatus::Done;
+                    // Auto-select first result
+                    if !self.youtube_results.is_empty() {
+                        self.youtube_list_state.select(Some(0));
+                    }
+                }
+                YoutubeSearchResult::Error(e) => {
+                    self.youtube_status = YoutubeStatus::Error(e);
+                }
+            }
+        }
+    }
+
+    pub fn youtube_scroll_down(&mut self) {
+        if self.youtube_results.is_empty() {
+            return;
+        }
+        let next = match self.youtube_list_state.selected() {
+            Some(i) => (i + 1).min(self.youtube_results.len() - 1),
+            None => 0,
+        };
+        self.youtube_list_state.select(Some(next));
+    }
+
+    pub fn youtube_scroll_up(&mut self) {
+        let prev = match self.youtube_list_state.selected() {
+            Some(0) | None => 0,
+            Some(i) => i - 1,
+        };
+        self.youtube_list_state.select(Some(prev));
+    }
+
+    pub fn selected_youtube_video(&self) -> Option<&YoutubeVideo> {
+        let i = self.youtube_list_state.selected()?;
+        self.youtube_results.get(i)
+    }
     // Call this every frame in the event loop - drains all pending files
     // that arrived since the last tick without blocking.
     pub fn poll_scan_results(&mut self) {

@@ -2,6 +2,7 @@ mod app;
 mod music;
 mod player;
 mod ui;
+mod youtube;
 
 use std::{io, path::PathBuf};
 
@@ -19,11 +20,13 @@ fn main() -> io::Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = app::App::new(PathBuf::from("/home/timus/Music"));
+    let api_key = std::env::var("YT_API_KEY").unwrap_or_else(|_| "".into());
+    let mut app = app::App::new(PathBuf::from("/home/timus/Music"), api_key);
 
     while app.running {
         app.poll_scan_results();
         app.poll_player_status();
+        app.poll_youtube_results();
         terminal.draw(|f| ui::draw(f, &mut app))?;
 
         // block until an event arrives - no busy-wait, no wasted CPU
@@ -37,8 +40,14 @@ fn main() -> io::Result<()> {
                         app.running = false;
                     }
 
+                    // Tab always switches mode regardless of what's focused
+                    (KeyCode::Tab, _) => app.toggle_search_mode(),
+
                     // Enter - play selected file(hook in audio backend here)
-                    (KeyCode::Enter, _) => app.play_selected(),
+                    (KeyCode::Enter, _) => match app.search_mode {
+                        app::SearchMode::Local => app.play_selected(),
+                        app::SearchMode::Youtube => app.submit_youtube_search(),
+                    },
 
                     // Pause / resume
                     (KeyCode::Char(' '), _) => app.toggle_pause(),
@@ -47,22 +56,36 @@ fn main() -> io::Result<()> {
                     (KeyCode::Char('s'), _) => app.stop(),
 
                     // Navigation
-                    (KeyCode::Down, _) => app.scroll_down(),
-                    (KeyCode::Up, _) => app.scroll_up(),
+                    (KeyCode::Down, _) => match app.search_mode {
+                        app::SearchMode::Local => app.scroll_down(),
+                        app::SearchMode::Youtube => app.youtube_scroll_down(),
+                    },
+                    (KeyCode::Up, _) => match app.search_mode {
+                        app::SearchMode::Local => app.scroll_up(),
+                        app::SearchMode::Youtube => app.youtube_scroll_up(),
+                    },
 
                     // Typing - update query and refilter
-                    (KeyCode::Char(c), _) => {
-                        let mut q = app.search_query.clone();
-                        q.push(c);
-                        app.update_search(&q);
-                    }
+                    (KeyCode::Char(c), _) => match app.search_mode {
+                        app::SearchMode::Local => {
+                            let mut q = app.search_query.clone();
+                            q.push(c);
+                            app.update_search(&q);
+                        }
+                        app::SearchMode::Youtube => app.youtube_query.push(c),
+                    },
 
                     // Backspace
-                    (KeyCode::Backspace, _) => {
-                        let mut q = app.search_query.clone();
-                        q.pop();
-                        app.update_search(&q);
-                    }
+                    (KeyCode::Backspace, _) => match app.search_mode {
+                        app::SearchMode::Local => {
+                            let mut q = app.search_query.clone();
+                            q.pop();
+                            app.update_search(&q);
+                        }
+                        app::SearchMode::Youtube => {
+                            app.youtube_query.pop();
+                        }
+                    },
 
                     _ => {}
                 }
