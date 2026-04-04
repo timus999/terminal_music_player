@@ -3,8 +3,9 @@ use crate::music::MusicFile;
 use crate::player::spawn_player;
 use crate::player::PlayerCommand;
 use crate::player::PlayerStatus;
-use crate::youtube::spawn_youtube_search;
-use crate::youtube::YoutubeSearchResult;
+use crate::youtube::spawn_youtube_runtime;
+use crate::youtube::YoutubeCommand;
+use crate::youtube::YoutubeResult;
 use crate::youtube::YoutubeVideo;
 use ratatui::widgets::ListState;
 use std::path::PathBuf;
@@ -12,6 +13,7 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 use std::sync::mpsc::Receiver;
 use std::sync::mpsc::Sender;
+use tokio::sync::mpsc::Sender as TokioSender;
 
 pub struct App {
     pub running: bool,
@@ -41,11 +43,19 @@ pub struct App {
     // --- YouTube search -----------
     pub search_mode: SearchMode,
     pub youtube_query: String,
+    // pub youtube_results: Vec<YoutubeVideo>,
+    // pub youtube_list_state: ListState,
+    // pub youtube_status: YoutubeStatus,
+    // youtube_query_tx: Sender<String>,
+    // youtube_result_rx: Receiver<YoutubeSearchResult>,
+
+    // Youtube - tokio side
     pub youtube_results: Vec<YoutubeVideo>,
     pub youtube_list_state: ListState,
     pub youtube_status: YoutubeStatus,
-    youtube_query_tx: Sender<String>,
-    youtube_result_rx: Receiver<YoutubeSearchResult>,
+
+    youtube_cmd_tx: TokioSender<YoutubeCommand>,
+    youtube_result_rx: Receiver<YoutubeResult>,
 }
 
 // Tab key toggles between these two modes
@@ -63,7 +73,7 @@ pub enum YoutubeStatus {
 }
 
 impl App {
-    pub fn new(music_dir: PathBuf, yt_api_key: String) -> Self {
+    pub fn new(music_dir: PathBuf, cookies_path: String) -> Self {
         // --- Scan channel ---
         let (scan_tx, scan_rx) = mpsc::channel();
 
@@ -73,11 +83,12 @@ impl App {
         // --- Player channel ---
         let (cmd_tx, cmd_rx) = mpsc::channel::<PlayerCommand>();
         let (status_tx, status_rx) = mpsc::channel::<PlayerStatus>();
-        spawn_player(cmd_rx, status_tx);
+        spawn_player(cmd_rx, status_tx, cookies_path.clone());
 
-        let (yt_query_tx, yt_query_rx) = mpsc::channel::<String>();
-        let (yt_result_tx, yt_result_rx) = mpsc::channel::<YoutubeSearchResult>();
-        spawn_youtube_search(yt_query_rx, yt_result_tx, yt_api_key);
+        // --- Youtube channels - tokio::sync::mpsc into runtime, std out
+        let (yt_cmd_tx, yt_cmd_rx) = tokio::sync::mpsc::channel(32);
+        let (yt_result_tx, yt_result_rx) = mpsc::channel();
+        spawn_youtube_runtime(yt_cmd_rx, yt_result_tx);
 
         Self {
             running: true,
@@ -99,7 +110,7 @@ impl App {
             youtube_results: Vec::new(),
             youtube_list_state: ListState::default(),
             youtube_status: YoutubeStatus::Idle,
-            youtube_query_tx: yt_query_tx,
+            youtube_cmd_tx: yt_cmd_tx,
             youtube_result_rx: yt_result_rx,
         }
     }
@@ -112,23 +123,35 @@ impl App {
         };
     }
 
-    /// Fire a Youtube search - called on Enter in Youtube mode.
-    /// Typing does NOT auto-search to avoid hammering the API.
-    pub fn submit_youtube_search(&mut self) {
-        if self.youtube_query.is_empty() {
-            return;
+    // app.rs
+    pub fn handle_enter(&mut self) {
+        match self.search_mode {
+            SearchMode::Local => self.play_selected(),
+            SearchMode::Youtube => self.play_selected_youtube(),
         }
-        self.youtube_status = YoutubeStatus::Searching;
-        self.youtube_results.clear();
-        self.youtube_list_state = ListState::default();
-        let _ = self.youtube_query_tx.send(self.youtube_query.clone());
+    }
+    /// Called on Enter in Youtube results - two-step;
+    /// 1. Ask rustypipe for the stream URL (async, non-blocking)
+    /// 2. When URL arrives in poll_youtube_results, send PlayUrl to mpv
+    pub fn play_selected_youtube(&mut self) {
+        if let Some(video) = self.selected_youtube_video() {
+            let y_video = video.clone();
+            self.current_track_name = video.title.clone();
+
+            // blocking send is fine here - the tokio channel has capacity 32
+            // and this returns immediately unless the buffer is full
+            let watch_url = format!("https://www.youtube.com/watch?v={}", y_video.video_id);
+            let _ = self.player_cmd_tx.send(PlayerCommand::PlayUrl(watch_url));
+
+            self.player_status = PlayerStatus::NowPlaying(Some(self.current_track_name.clone()));
+        }
     }
 
     /// Drain pending Youtube results - call once per frame
     pub fn poll_youtube_results(&mut self) {
         while let Ok(result) = self.youtube_result_rx.try_recv() {
             match result {
-                YoutubeSearchResult::Results(videos) => {
+                YoutubeResult::SearchResults(videos) => {
                     self.youtube_results = videos;
                     self.youtube_status = YoutubeStatus::Done;
                     // Auto-select first result
@@ -136,13 +159,32 @@ impl App {
                         self.youtube_list_state.select(Some(0));
                     }
                 }
-                YoutubeSearchResult::Error(e) => {
+
+                // Stream URL arrived - hand it straight to mpv
+                YoutubeResult::StreamUrl(url) => {
+                    let _ = self.player_cmd_tx.send(PlayerCommand::PlayUrl(url));
+                    // Update status bar immediately - mpv will start in - 100ms
+                    self.player_status =
+                        PlayerStatus::NowPlaying(Some(self.current_track_name.clone()));
+                }
+                YoutubeResult::Error(e) => {
+                    self.player_status = PlayerStatus::Error(e.clone());
                     self.youtube_status = YoutubeStatus::Error(e);
                 }
             }
         }
     }
 
+    pub fn submit_youtube_search(&mut self) {
+        if self.youtube_query.is_empty() {
+            return;
+        }
+        self.youtube_status = YoutubeStatus::Searching;
+        self.youtube_results.clear();
+        let _ = self
+            .youtube_cmd_tx
+            .blocking_send(YoutubeCommand::Search(self.youtube_query.clone()));
+    }
     pub fn youtube_scroll_down(&mut self) {
         if self.youtube_results.is_empty() {
             return;
@@ -254,7 +296,7 @@ impl App {
             let path = file.path.clone();
             self.is_paused = false;
             // Silently ignore send errors - player thread may have exited
-            let _ = self.player_cmd_tx.send(PlayerCommand::Play(path));
+            let _ = self.player_cmd_tx.send(PlayerCommand::PlayFile(path));
         }
     }
 
@@ -296,8 +338,11 @@ impl App {
                 }
 
                 PlayerStatus::FinishedNaturally => {
-                    self.scroll_down();
-                    self.play_selected();
+                    // only auto-advance in local mode - Youtube handles it's own flow
+                    if matches!(self.search_mode, SearchMode::Local) {
+                        self.scroll_down();
+                        self.play_selected();
+                    }
                     self.is_paused = false;
                 }
                 PlayerStatus::Error(_) => {
