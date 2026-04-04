@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -14,6 +14,7 @@ pub enum PlayerCommand {
     Pause,
     Resume,
     Stop,
+    SetVolume(f32),
 }
 
 #[derive(Clone)]
@@ -22,6 +23,7 @@ pub enum PlayerStatus {
     Paused,
     Stopped,
     FinishedNaturally,
+    Position(f64),
     Error(String),
 }
 
@@ -151,6 +153,8 @@ pub fn spawn_player(
         let mut is_paused = false;
         let mut stop_requested = false;
 
+        let mut ipc: Option<MpvIpc> = None;
+
         loop {
             // Poll for natural completion — skipped when paused or after
             // an explicit stop to avoid false FinishedNaturally signals
@@ -166,10 +170,42 @@ pub fn spawn_player(
                 }
             }
 
+            // Poll mpv IPC - only when Mpv backend is active
+            if matches!(backend, PlaybackBackend::Mpv { .. }) {
+                // Try to connect if now yet connected
+                if ipc.is_none() {
+                    if let Some(mut conn) = MpvIpc::connect() {
+                        conn.register_observers();
+                        ipc = Some(conn);
+                    }
+                }
+
+                if let Some(ref mut conn) = ipc {
+                    let events = conn.drain();
+                    for event in events {
+                        // observe_property events have "event":"property-change"
+                        if event["event"] == "property-change" {
+                            let id = event["id"].as_u64();
+                            let data = event["data"].as_f64();
+                            match (id, data) {
+                                (Some(1), Some(pos)) => {
+                                    let _ = status_tx.send(PlayerStatus::Position(pos));
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            } else {
+                // not playing via mpv - drop the connection
+                ipc = None;
+            }
+
             match cmd_rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(cmd) => handle_command(
                     cmd,
                     &player,
+                    &mut ipc,
                     &mut backend,
                     &mut is_paused,
                     &mut stop_requested,
@@ -195,6 +231,7 @@ pub fn spawn_player(
 fn handle_command(
     cmd: PlayerCommand,
     player: &Player,
+    ipc: &mut Option<MpvIpc>,
     backend: &mut PlaybackBackend,
     is_paused: &mut bool,
     stop_requested: &mut bool,
@@ -238,6 +275,7 @@ fn handle_command(
 
         PlayerCommand::PlayUrl(url) => {
             backend.stop_current(player);
+            *ipc = None;
             *is_paused = false;
             *stop_requested = false;
 
@@ -278,6 +316,26 @@ fn handle_command(
             backend.stop_current(player);
             *is_paused = false;
             let _ = status_tx.send(PlayerStatus::Stopped);
+        }
+
+        PlayerCommand::SetVolume(vol) => {
+            // rodio - set on player directly
+            // mpv - send via IPC
+            match backend {
+                PlaybackBackend::Rodio => {
+                    // rodio Player doesn't expose volume directly
+                    // store and apply on next append
+                }
+                PlaybackBackend::Mpv { .. } => {
+                    let pct = (vol * 100.0) as u32;
+
+                    mpv_ipc(&format!(
+                        r#"{{"command":["set_property","volume",{}]}}"#,
+                        pct
+                    ));
+                }
+                PlaybackBackend::Idle => {}
+            }
         }
     }
 }
@@ -327,4 +385,81 @@ fn resolve_binary_path(name: &str) -> Option<String> {
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+}
+
+/// Queries a single numeric property from mpv via IPC.
+/// Returns None if mpv isn't running or property isn't available yet.
+// pub fn mpv_get_property(property: &str) -> Option<f64> {
+//     let mut stream = UnixStream::connect(MPV_SOCKET).ok()?;
+//     stream
+//         .set_read_timeout(Some(Duration::from_millis(50)))
+//         .ok()?;
+
+//     let cmd = format!(
+//         r#"{{"command":["get_property","{}"],"request_id":1}}{}"#,
+//         property, "\n"
+//     );
+//     stream.write_all(cmd.as_bytes()).ok()?;
+
+//     let mut buf = vec![0u8; 256];
+//     let n = stream.read(&mut buf).ok()?;
+//     let response = std::str::from_utf8(&buf[..n]).ok()?;
+
+//     // mpv may send multiple newline-delimited JSON objects — find the one
+//     // with our request_id
+//     for line in response.lines() {
+//         if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
+//             if val["request_id"] == 1 && val["error"] == "success" {
+//                 return val["data"].as_f64();
+//             }
+//         }
+//     }
+//     None
+// }
+
+struct MpvIpc {
+    stream: UnixStream,
+}
+
+impl MpvIpc {
+    /// Connect to the socket — retries until mpv creates it
+    fn connect() -> Option<Self> {
+        let stream = UnixStream::connect(MPV_SOCKET).ok()?;
+        stream
+            .set_read_timeout(Some(Duration::from_millis(20)))
+            .ok()?;
+        stream.set_nonblocking(false).ok()?;
+        Some(Self { stream })
+    }
+
+    /// Register observers once after connecting — mpv will push updates
+    /// automatically every time the property changes
+    fn register_observers(&mut self) -> bool {
+        // observe_property id=1 for time-pos,
+        self.send(r#"{"command":["observe_property",1,"time-pos"]}"#)
+    }
+    fn send(&mut self, json: &str) -> bool {
+        self.stream
+            .write_all(format!("{json}\n").as_bytes())
+            .is_ok()
+    }
+
+    /// Reads all pending lines — mpv sends events continuously
+    fn drain(&mut self) -> Vec<serde_json::Value> {
+        let mut buf = vec![0u8; 4096];
+        let mut results = Vec::new();
+
+        match self.stream.read(&mut buf) {
+            Ok(n) if n > 0 => {
+                let text = String::from_utf8_lossy(&buf[..n]);
+                for line in text.lines() {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                        results.push(v);
+                    }
+                }
+            }
+            _ => {}
+        }
+        results
+    }
 }

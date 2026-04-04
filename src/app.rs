@@ -13,8 +13,23 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 use std::sync::mpsc::Receiver;
 use std::sync::mpsc::Sender;
+use std::time::Duration;
 use tokio::sync::mpsc::Sender as TokioSender;
 
+#[derive(PartialEq)]
+pub enum InputMode {
+    Normal, // Keys trigger commands (navigate, pause, stop),
+    Typing, // all chars go the active search bar
+}
+
+pub enum DisplayStatus {
+    Idle,
+    Playing,
+    Paused,
+    Stopped,
+    Finished,
+    Error(String),
+}
 pub struct App {
     pub running: bool,
 
@@ -56,6 +71,16 @@ pub struct App {
 
     youtube_cmd_tx: TokioSender<YoutubeCommand>,
     youtube_result_rx: Receiver<YoutubeResult>,
+    pub is_youtube_playing: bool, // tracks whether current track is a Youtube stream
+
+    pub input_mode: InputMode,
+    pub volume: f32,        // 0.0 to 1.0
+    pub animation_tick: u8, // increments each frame for the visualizer
+
+    pub current_duration: Option<Duration>, // seconds, from mpv or symphonia
+    pub current_position: f64,              // seconds, from mpv or estimated
+
+    pub display_status: DisplayStatus,
 }
 
 // Tab key toggles between these two modes
@@ -112,6 +137,15 @@ impl App {
             youtube_status: YoutubeStatus::Idle,
             youtube_cmd_tx: yt_cmd_tx,
             youtube_result_rx: yt_result_rx,
+            is_youtube_playing: false,
+
+            input_mode: InputMode::Normal,
+            volume: 1.0,
+            animation_tick: 0,
+            current_duration: None,
+            current_position: 0.0,
+
+            display_status: DisplayStatus::Idle,
         }
     }
 
@@ -126,8 +160,18 @@ impl App {
     // app.rs
     pub fn handle_enter(&mut self) {
         match self.search_mode {
-            SearchMode::Local => self.play_selected(),
-            SearchMode::Youtube => self.play_selected_youtube(),
+            SearchMode::Local => {
+                self.input_mode = InputMode::Normal;
+                self.play_selected();
+            }
+            SearchMode::Youtube => {
+                if self.input_mode == InputMode::Typing {
+                    self.input_mode = InputMode::Normal;
+                    self.submit_youtube_search();
+                } else {
+                    self.play_selected_youtube();
+                }
+            }
         }
     }
     /// Called on Enter in Youtube results - two-step;
@@ -137,13 +181,24 @@ impl App {
         if let Some(video) = self.selected_youtube_video() {
             let y_video = video.clone();
             self.current_track_name = video.title.clone();
+            self.current_position = 0.0;
+            self.current_duration = if y_video.duration_secs > 0 {
+                Some(std::time::Duration::from_secs(y_video.duration_secs))
+            } else {
+                None
+            };
 
             // blocking send is fine here - the tokio channel has capacity 32
             // and this returns immediately unless the buffer is full
             let watch_url = format!("https://www.youtube.com/watch?v={}", y_video.video_id);
             let _ = self.player_cmd_tx.send(PlayerCommand::PlayUrl(watch_url));
 
+            // Reset timer here - same logic as poll_player_status does for local_files
+            self.is_paused = false;
+            self.display_status = DisplayStatus::Playing;
+
             self.player_status = PlayerStatus::NowPlaying(Some(self.current_track_name.clone()));
+            self.is_youtube_playing = true;
         }
     }
 
@@ -294,7 +349,10 @@ impl App {
     pub fn play_selected(&mut self) {
         if let Some(file) = self.selected_file() {
             let path = file.path.clone();
+            self.current_duration = read_audio_duration(&path);
+            self.current_position = 0.0;
             self.is_paused = false;
+            self.is_youtube_playing = false;
             // Silently ignore send errors - player thread may have exited
             let _ = self.player_cmd_tx.send(PlayerCommand::PlayFile(path));
         }
@@ -327,31 +385,100 @@ impl App {
             match status {
                 PlayerStatus::NowPlaying(Some(ref name)) => {
                     self.current_track_name = name.clone();
+                    self.current_position = 0.0;
                     self.is_paused = false;
+
+                    self.display_status = DisplayStatus::Playing;
                 }
                 PlayerStatus::NowPlaying(None) => {
                     // Restore cached name and skip the standard status update
                     self.player_status =
                         PlayerStatus::NowPlaying(Some(self.current_track_name.clone()));
+                    self.display_status = DisplayStatus::Playing;
+                    // Resume - start a new segment, keep accumulated
                     self.is_paused = false;
                     continue;
                 }
+                PlayerStatus::Position(pos) => {
+                    self.current_position = pos;
+                }
+                PlayerStatus::Paused => {
+                    self.is_paused = true;
+                    self.display_status = DisplayStatus::Paused;
+                }
 
                 PlayerStatus::FinishedNaturally => {
+                    self.is_paused = false;
                     // only auto-advance in local mode - Youtube handles it's own flow
+                    self.current_position = 0.0;
+                    self.current_duration = None;
+                    self.is_youtube_playing = false;
+                    self.display_status = DisplayStatus::Finished;
                     if matches!(self.search_mode, SearchMode::Local) {
                         self.scroll_down();
                         self.play_selected();
                     }
-                    self.is_paused = false;
+                    if matches!(self.search_mode, SearchMode::Youtube) {
+                        self.youtube_scroll_down();
+                        self.play_selected_youtube();
+                    }
                 }
-                PlayerStatus::Error(_) => {
+                PlayerStatus::Error(_) | PlayerStatus::Stopped => {
                     self.is_paused = false;
+                    self.current_duration = None;
+                    self.current_position = 0.0;
+
+                    self.display_status = DisplayStatus::Stopped;
+                    self.is_youtube_playing = false;
                 }
-                _ => {}
             }
 
             self.player_status = status;
         }
     }
+
+    pub fn tick(&mut self) {
+        // Called every frame - advances animation
+        self.animation_tick = self.animation_tick.wrapping_add(1);
+    }
+
+    pub fn volume_up(&mut self) {
+        self.volume = (self.volume + 0.05).min(1.0);
+        let _ = self
+            .player_cmd_tx
+            .send(PlayerCommand::SetVolume(self.volume));
+    }
+
+    pub fn volume_down(&mut self) {
+        self.volume = (self.volume - 0.05).max(0.0);
+        let _ = self
+            .player_cmd_tx
+            .send(PlayerCommand::SetVolume(self.volume));
+    }
+
+    pub fn elapsed_secs(&self) -> f64 {
+        self.current_position
+    }
+}
+pub fn read_audio_duration(path: &std::path::PathBuf) -> Option<std::time::Duration> {
+    use std::fs::File;
+    let file = File::open(path).ok()?;
+    let mss = symphonia::core::io::MediaSourceStream::new(Box::new(file), Default::default());
+
+    let mut hint = symphonia::core::probe::Hint::new();
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        hint.with_extension(ext);
+    }
+
+    let meta = symphonia::default::get_probe()
+        .format(&hint, mss, &Default::default(), &Default::default())
+        .ok()?;
+
+    let track = meta.format.default_track()?;
+    let tb = track.codec_params.time_base?;
+    let frames = track.codec_params.n_frames?;
+    let time = tb.calc_time(frames);
+    Some(std::time::Duration::from_secs_f64(
+        time.seconds as f64 + time.frac,
+    ))
 }
