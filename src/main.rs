@@ -1,11 +1,12 @@
 mod app;
+mod image_fetcher;
 mod music;
 mod player;
 mod ui;
 mod youtube;
 
 use crossterm::{
-    event::{self, Event, KeyCode},
+    event::{self, Event, KeyCode, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -13,7 +14,10 @@ use dirs;
 use ratatui::{backend::CrosstermBackend, Terminal};
 use std::{io, path::PathBuf};
 
-use crate::app::{InputMode, SearchMode};
+use crate::{
+    app::{InputMode, SearchMode},
+    ui::UiState,
+};
 
 fn main() -> io::Result<()> {
     enable_raw_mode()?;
@@ -28,12 +32,14 @@ fn main() -> io::Result<()> {
             .unwrap_or_else(|| "cookies.txt".to_string())
     });
     let mut app = app::App::new(PathBuf::from("/home/timus/Music"), cookies_path);
+    let mut ui_state = UiState::new();
 
     while app.running {
         app.poll_scan_results();
         app.poll_player_status();
         app.poll_youtube_results();
-        terminal.draw(|f| ui::draw(f, &mut app))?;
+        app.poll_image();
+        terminal.draw(|f| ui::draw(f, &mut app, &mut ui_state))?;
 
         // block until an event arrives - no busy-wait, no wasted CPU
         //
@@ -91,11 +97,20 @@ fn main() -> io::Result<()> {
                             SearchMode::Local => app.scroll_up(),
                             SearchMode::Youtube => app.youtube_scroll_up(),
                         },
+
+                        KeyCode::Char('a') => app.add_to_playlist(),
+                        KeyCode::Char('d') => app.remove_from_playlist(),
+                        KeyCode::Char('p') => app.play_selected_playlist(),
                         KeyCode::Char('+') => app.volume_up(),
                         KeyCode::Char('-') => app.volume_down(),
                         KeyCode::Esc => {
                             app.input_mode = InputMode::Normal; // no-op, already normal
                         }
+                        // Ctrl+Down/Up navigate playlist
+                        KeyCode::Char('j') => app.playlist_scroll_down(),
+
+                        KeyCode::Char('k') => app.playlist_scroll_up(),
+
                         _ => {}
                     },
                 }

@@ -10,6 +10,8 @@ use crate::youtube::YoutubeVideo;
 use ratatui::widgets::ListState;
 use std::path::PathBuf;
 
+use crate::image_fetcher::{spawn_image_fetcher, ImageCommand, ImageResult};
+
 use std::sync::mpsc;
 use std::sync::mpsc::Receiver;
 use std::sync::mpsc::Sender;
@@ -30,6 +32,15 @@ pub enum DisplayStatus {
     Finished,
     Error(String),
 }
+
+#[derive(Clone)]
+pub struct PlaylistEntry {
+    pub name: String,
+    pub path_or_url: String,
+    pub is_youtube: bool,
+    pub duration_secs: u64,
+}
+
 pub struct App {
     pub running: bool,
 
@@ -81,6 +92,16 @@ pub struct App {
     pub current_position: f64,              // seconds, from mpv or estimated
 
     pub display_status: DisplayStatus,
+
+    // Playlist
+    pub playlist: Vec<PlaylistEntry>,
+    pub playlist_state: ListState,
+
+    // Image
+    pub current_image: Option<image::DynamicImage>,
+    pub current_image_id: usize,
+    image_cmd_tx: std::sync::mpsc::Sender<ImageCommand>,
+    image_result_rx: std::sync::mpsc::Receiver<ImageResult>,
 }
 
 // Tab key toggles between these two modes
@@ -115,6 +136,11 @@ impl App {
         let (yt_result_tx, yt_result_rx) = mpsc::channel();
         spawn_youtube_runtime(yt_cmd_rx, yt_result_tx);
 
+        // --- Images ----
+        let (img_cmd_tx, img_cmd_rx) = std::sync::mpsc::channel();
+        let (img_result_tx, img_result_rx) = std::sync::mpsc::channel();
+        spawn_image_fetcher(img_cmd_rx, img_result_tx);
+
         Self {
             running: true,
             search_query: String::new(),
@@ -146,6 +172,16 @@ impl App {
             current_position: 0.0,
 
             display_status: DisplayStatus::Idle,
+
+            // playlist
+            playlist: Vec::new(),
+            playlist_state: ListState::default(),
+
+            // Image
+            current_image: None,
+            current_image_id: 0,
+            image_cmd_tx: img_cmd_tx,
+            image_result_rx: img_result_rx,
         }
     }
 
@@ -191,14 +227,21 @@ impl App {
             // blocking send is fine here - the tokio channel has capacity 32
             // and this returns immediately unless the buffer is full
             let watch_url = format!("https://www.youtube.com/watch?v={}", y_video.video_id);
-            let _ = self.player_cmd_tx.send(PlayerCommand::PlayUrl(watch_url));
 
             // Reset timer here - same logic as poll_player_status does for local_files
             self.is_paused = false;
             self.display_status = DisplayStatus::Playing;
 
-            self.player_status = PlayerStatus::NowPlaying(Some(self.current_track_name.clone()));
             self.is_youtube_playing = true;
+
+            // Fetch Youtube thumbnail
+            let _ = self
+                .image_cmd_tx
+                .send(ImageCommand::FetchYoutube(y_video.video_id.clone()));
+
+            let watch_url = format!("https://www.youtube.com/watch?v={}", y_video.video_id);
+            let _ = self.player_cmd_tx.send(PlayerCommand::PlayUrl(watch_url));
+            self.player_status = PlayerStatus::NowPlaying(Some(self.current_track_name.clone()));
         }
     }
 
@@ -353,6 +396,10 @@ impl App {
             self.current_position = 0.0;
             self.is_paused = false;
             self.is_youtube_playing = false;
+            // Fetch cover art for the local file
+            let _ = self
+                .image_cmd_tx
+                .send(ImageCommand::FetchLocal(path.clone()));
             // Silently ignore send errors - player thread may have exited
             let _ = self.player_cmd_tx.send(PlayerCommand::PlayFile(path));
         }
@@ -459,7 +506,130 @@ impl App {
     pub fn elapsed_secs(&self) -> f64 {
         self.current_position
     }
+
+    pub fn poll_image(&mut self) {
+        while let Ok(result) = self.image_result_rx.try_recv() {
+            match result {
+                ImageResult::Loaded(img) => {
+                    self.current_image = Some(img);
+                    self.current_image_id += 1; // signal ui to rebuild protocol
+                }
+                ImageResult::NotFound | ImageResult::Error(_) => {
+                    self.current_image = None;
+                    self.current_image_id += 1;
+                }
+            }
+        }
+    }
+
+    pub fn add_to_playlist(&mut self) {
+        match self.search_mode {
+            SearchMode::Local => {
+                if let Some(file) = self.selected_file() {
+                    let entry = PlaylistEntry {
+                        name: file.name.clone(),
+                        path_or_url: file.path.to_string_lossy().to_string(),
+                        is_youtube: false,
+                        duration_secs: 0,
+                    };
+                    if !self
+                        .playlist
+                        .iter()
+                        .any(|e| e.path_or_url == entry.path_or_url)
+                    {
+                        self.playlist.push(entry);
+                    }
+                }
+            }
+
+            SearchMode::Youtube => {
+                if let Some(video) = self.selected_youtube_video() {
+                    let entry = PlaylistEntry {
+                        name: video.title.clone(),
+                        path_or_url: format!("https://www.youtube.com/watch?v={}", video.video_id),
+                        is_youtube: true,
+                        duration_secs: video.duration_secs,
+                    };
+
+                    if !self
+                        .playlist
+                        .iter()
+                        .any(|e| e.path_or_url == entry.path_or_url)
+                    {
+                        self.playlist.push(entry);
+                    }
+                }
+            }
+        }
+        // Select last added
+        if !self.playlist.is_empty() {
+            self.playlist_state.select(Some(self.playlist.len() - 1));
+        }
+    }
+
+    pub fn remove_from_playlist(&mut self) {
+        if let Some(i) = self.playlist_state.selected() {
+            self.playlist.remove(i);
+            let new_sel = i.saturating_sub(1);
+            self.playlist_state.select(if self.playlist.is_empty() {
+                None
+            } else {
+                Some(new_sel)
+            });
+        }
+    }
+
+    pub fn play_selected_playlist(&mut self) {
+        if let Some(i) = self.playlist_state.selected() {
+            if let Some(entry) = self.playlist.get(i) {
+                self.current_track_name = entry.name.clone();
+                self.current_position = 0.0;
+                self.current_duration = if entry.duration_secs > 0 {
+                    Some(Duration::from_secs(entry.duration_secs))
+                } else {
+                    None
+                };
+
+                if entry.is_youtube {
+                    self.is_youtube_playing = true;
+                    let url = entry.path_or_url.clone();
+                    // Extract video_id for thumbnail
+                    let video_id = url.split("v=").nth(1).unwrap_or("").to_string();
+                    let _ = self.image_cmd_tx.send(ImageCommand::FetchYoutube(video_id));
+                    let _ = self.player_cmd_tx.send(PlayerCommand::PlayUrl(url));
+                } else {
+                    self.is_youtube_playing = false;
+                    let path = PathBuf::from(&entry.path_or_url);
+                    let _ = self
+                        .image_cmd_tx
+                        .send(ImageCommand::FetchLocal(path.clone()));
+                    let _ = self.player_cmd_tx.send(PlayerCommand::PlayFile(path));
+                }
+                self.display_status = DisplayStatus::Playing;
+            }
+        }
+    }
+
+    pub fn playlist_scroll_down(&mut self) {
+        if self.playlist.is_empty() {
+            return;
+        }
+        let next = match self.playlist_state.selected() {
+            Some(i) => (i + 1).min(self.playlist.len() - 1),
+            None => 0,
+        };
+        self.playlist_state.select(Some(next));
+    }
+
+    pub fn playlist_scroll_up(&mut self) {
+        let prev = match self.playlist_state.selected() {
+            Some(0) | None => 0,
+            Some(i) => i - 1,
+        };
+        self.playlist_state.select(Some(prev));
+    }
 }
+
 pub fn read_audio_duration(path: &std::path::PathBuf) -> Option<std::time::Duration> {
     use std::fs::File;
     let file = File::open(path).ok()?;
